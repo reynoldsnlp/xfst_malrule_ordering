@@ -25,12 +25,19 @@ parser.add_argument('files', type=str, nargs='*', default=[],
 
 args = parser.parse_args()
 
-ex_changes = {'V': [('a', 'b')],
-              'W': [('b', 'a')],
-              'X': [('b', 'c')],
-              'Y': [('c', 'd')],
-              'Z': [('d', 'a')]
+ex_changes = {'a1': [('i', 'j')],
+              'a2': [('j', 'k')],
+              'a3': [('k', 'l')],
+              'b1': [('m', 'n')],
+              'b2': [('n', 'm')],
+              'c1': [('a', 'e')],
+              'c2': [('e', 'i')],
+              'c3': [('i', 'o')],
+              'c4': [('o', 'u')],
+              'c5': [('u', 'a')],
               }
+ex_changes = {name: [(j, i) for i, j in rules]
+              for name, rules in ex_changes.items()}
 
 def affix_indices(fnames):
     shared_fname_prefix = 0
@@ -49,9 +56,30 @@ def affix_indices(fnames):
             break
     return shared_fname_prefix, shared_fname_suffix
 
+
+def clean_xfst_regex_file(fname: str):
+    cleaned_lines = []
+    with open(fname) as f:
+        for line in f:
+            if line.startswith('#') or line.strip() == '':
+                continue
+            else:
+                cleaned = line.strip().rstrip(' \n\t;')
+                if cleaned:
+                    cleaned_lines.append(cleaned)
+    cleaned_file = ' '.join(cleaned_lines)
+    if not cleaned_file.startswith('[') or not cleaned_file.endswith(']'):
+        cleaned_file = f'[ {cleaned_file} ]'
+    cleaned_file = f'{cleaned_file} .o.\n'
+    return cleaned_file
+
+
 def foma_dot_graph_from_files(fnames) -> nx.DiGraph:
     """Use foma to generate a dot file from the composition
     of all the rules. Return networkx DiGraph of dot file.
+
+    This might be problematic because composition, in general, is NOT
+    commutative. (That might not be relevant for detecting cycles, though?) 
     """
     shared_fname_prefix, shared_fname_suffix = affix_indices(fnames)
     foma_src = ''
@@ -60,29 +88,20 @@ def foma_dot_graph_from_files(fnames) -> nx.DiGraph:
         # foma_src += f'# {display_name}\n'
         if i == 0:
             foma_src += 'regex '
-        cleaned_lines = []
-        with open(fname) as f:
-            for line in f:
-                if line.startswith('#') or line.strip() == '':
-                    continue
-                else:
-                    cleaned = line.strip().rstrip(' \n\t;')
-                    if cleaned:
-                        cleaned_lines.append(cleaned)
-        cleaned_file = ' '.join(cleaned_lines)
-        if not cleaned_file.startswith('[') or not cleaned_file.endswith(']'):
-            cleaned_file = f'[ {cleaned_file} ]'
-        cleaned_file = f'{cleaned_file} .o.\n'
-        foma_src += cleaned_file
+        foma_src += clean_xfst_regex_file(fname)
     assert ';' not in foma_src
-    foma_src = foma_src.rstrip('.o\n') + ';\nprint dot\nview net\n'
-    # foma_src = foma_src.replace('.o. ', '.o.\n\t')
-    print(foma_src)
+    foma_src = foma_src.rstrip('.o\n') 
+    TMP_FNAME = '/tmp/xfst_malrule_ordering_foma.dot'
+    foma_src += f';\nprint dot >{TMP_FNAME}\nview net\n'
     escaped_quote = '\\"'
-    dot = subprocess.run('foma', input=foma_src,
-                         text=True, capture_output=True, shell=True)
-    dot = re.search(r'(digraph.*)', dot.stdout, re.S).group(1).strip()
-    print(dot)
+    foma_proc = subprocess.run('foma', input=foma_src,
+                               text=True, capture_output=True, shell=True)
+    dot_match = re.search(r'(digraph.*)', foma_proc.stdout, re.S)
+    if dot_match:
+        dot = dot_match.group(1).strip()
+    else:
+        raise ValueError(f'Foma did not output a dot file:\n{foma_proc}')
+    return nx.drawing.nx_pydot.read_dot(TMP_FNAME)
 
 
 def changes_from_files(fnames) -> dict:
@@ -96,6 +115,12 @@ def changes_from_files(fnames) -> dict:
 
 
 def src_and_tgt_symbols(change_dict):
+    """
+    Returns
+    =======
+    src_symbols -- {symbol: [all, rules, with, this, symbol, in, source}
+    tgt_symbols -- {symbol: [all, rules, with, this, symbol, in, target}
+    """
     src_symbols = DefaultDict(list)
     tgt_symbols = DefaultDict(list)
     for rule_name, changes in change_dict.items():
@@ -106,13 +131,9 @@ def src_and_tgt_symbols(change_dict):
 
 
 def parallelize_rules(rule_sets, u, v):
-    print('input rule_sets', rule_sets)
-    print('input nodes:', u, v)
     output_sets = []
     new_set = set()
     for s in rule_sets:
-        print('current_set:', s)
-        print('new_set:', new_set)
         if u in s or v in s:
             new_set.add(u)
             new_set.add(v)
@@ -124,7 +145,6 @@ def parallelize_rules(rule_sets, u, v):
         output_sets.append(new_set)
     else:
         output_sets.append({u, v})
-    print('=' * 79)
     return output_sets
 
 
@@ -138,15 +158,16 @@ def get_pos_from_dot(dot_str):
         match = re.search(r'(\w+)\s+\[.*?pos="[0-9.]+,([0-9.]+)', e, re.S)
         if match:
             y_coords.append(match.groups())
-        else:
-            print('no match:', repr(e))
+    y_coords = [(node, float(y)) for node, y in y_coords]
+    y_coords = sorted(y_coords, key=lambda x: x[1], reverse=True)
     return y_coords
-    
+
 
 def rule_ordering(rule_sets, node_pos, maximal_feeding=True):
     y_coords = sorted(node_pos, key=lambda x: x[1], reverse=maximal_feeding)
     already_added = set()
     ordering = []
+    rule_sets = rule_sets.copy()
     for node, y in node_pos:
         if node in already_added:
             continue
@@ -166,8 +187,39 @@ def rule_ordering(rule_sets, node_pos, maximal_feeding=True):
     return ordering
 
 
+def final_ordering(g, rule_sets):
+    g_pydot = nx.drawing.nx_pydot.to_pydot(g)
+    g_pydot.write_png('network.png')
+    gv_dot_str = g_pydot.create_dot().decode('utf-8')
+    with open('network.dot', 'w') as f:
+        print(gv_dot_str, file=f)
+    node_pos = get_pos_from_dot(gv_dot_str)
+    ordering = rule_ordering(rule_sets, node_pos)
+    return ordering
+
+def has_counterfeeding_order(ordering, feeding_cycle):
+    """Check whether the given cycle has any counterfeeding orders in the
+    given ordering."""
+    # determine which node to start from in the cycle
+    for o in ordering:
+        c_i = [i for i, u in enumerate(feeding_cycle) if u == o or u in o]
+        if c_i:
+            break
+    c_i = c_i[0]
+    feeding_cycle = feeding_cycle[c_i:] + feeding_cycle[:c_i]
+    order_iter = iter(ordering)
+    try:
+        for u in feeding_cycle:
+            o = next(order_iter)
+            while u != o or u not in o:
+                o = next(order_iter)
+        return False
+    except StopIteration:
+        return True
+
+
 if __name__ == '__main__':
-    rule_sets = []
+    rule_sets: list[set] = []
     if args.files:
         change_dict = changes_from_files(args.files)
         src_symbols, tgt_symbols = src_and_tgt_symbols(change_dict)
@@ -176,14 +228,14 @@ if __name__ == '__main__':
         src_symbols, tgt_symbols = src_and_tgt_symbols(change_dict)
         
     g = nx.MultiDiGraph()
-    removed_g = nx.MultiDiGraph()
     for rule_name, changes in change_dict.items():
+        g.add_node(rule_name)
         for tgt, src in changes:
-            for bleed_name in src_symbols.get(tgt, []):
-                g.add_edge(rule_name, bleed_name, change=f'{src}->{tgt}')
+            for feed_name in src_symbols.get(tgt, []):
+                if rule_name != feed_name:
+                    g.add_edge(rule_name, feed_name, label=f'  {src}→{tgt}')
 
     while remaining_cycles := sorted((c for c in nx.simple_cycles(g) if len(c) > 1), key=len):
-        pprint(nx.to_dict_of_dicts(g))
         cycles_len = len(remaining_cycles)
         if not cycles_len:
             break
@@ -204,6 +256,9 @@ if __name__ == '__main__':
                         edges = tuple(e for e in zip(c, c[1:]))
                     else:
                         edges = tuple(e for e in zip(c, c[1:] + [c[0]]))
+                        ordering = final_ordering(g, rule_sets)
+                        if has_counterfeeding_order(ordering, c):
+                            print('NOTE: dot places this cycle in a counterfeeding order! Parallelization may not be necessary.')
                     for i, (u, v) in enumerate(edges):
                         print(f'({i}) {u}->{v}')
                     print('Current parallel rules:', rule_sets)
@@ -211,11 +266,11 @@ if __name__ == '__main__':
                     if response in ('Q', 'q', 'Quit', 'quit', 'QUIT'):
                         break
                     elif response in ('', 'y', 'yes', 'Yes', 'Y', 'YES'):
-                        response = [i for i in range(len(edges))]
+                        responses = [i for i in range(len(edges))]
                     else:
-                        response = [int(i) for i in response.split(' ')]
+                        responses = [int(i) for i in response.split(' ')]
                     for i, (u, v) in enumerate(edges):
-                        if i in response:
+                        if i in responses:
                             print(f'removing the edge ({u}, {v})...')
                             while g.has_edge(u, v):
                                 g.remove_edge(u, v)
@@ -225,17 +280,9 @@ if __name__ == '__main__':
     nx.draw_networkx(g, pos=nx.spring_layout(g))
     # plt.show()
 
-    # nx.drawing.nx_pydot.write_dot(g, 'network.dot')
-    g_pydot = nx.drawing.nx_pydot.to_pydot(g)
-    g_pydot.write_png('network.png')
-    gv_dot_str = g_pydot.create_dot().decode('utf-8')
-    print('dot str:\n', gv_dot_str)
-    node_pos = get_pos_from_dot(gv_dot_str)
-    print('node_pos:\n', node_pos)
+    ordering = final_ordering(g, rule_sets)
     print('rule_sets:\n', rule_sets)
-    ordering = rule_ordering(rule_sets, node_pos)
     print('ordering:\n', ordering)
-
 
 
 
